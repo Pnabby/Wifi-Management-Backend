@@ -298,10 +298,7 @@ def credentials_summary():
             ("order", "plan_type.asc"),
         ],
     )
-    login_rows, _ = _supabase_get(
-        "Logins",
-        params=[("select", "type")],
-    )
+    login_rows = _iterate_table("Logins", select="type")
 
     counts: Dict[str, int] = {}
     for row in login_rows:
@@ -479,16 +476,26 @@ def _iterate_transactions(
     filters: Optional[List[Tuple[str, str]]] = None,
     select: str = "customer_email,credential_username,amount,plan_type,created_at",
 ) -> List[Dict[str, Any]]:
+    return _iterate_table("Transactions", select=select, filters=filters)
+
+
+def _iterate_table(
+    table: str,
+    *,
+    select: str,
+    filters: Optional[List[Tuple[str, str]]] = None,
+    page_size: int = 1000,
+) -> List[Dict[str, Any]]:
     params: List[Tuple[str, str]] = [("select", select)]
     if filters:
         params.extend(filters)
 
     offset = 0
-    page_size = 1000
     all_rows: List[Dict[str, Any]] = []
+    page_size = max(int(page_size), 1)
     while True:
         paged_params = params + [("limit", str(page_size)), ("offset", str(offset))]
-        rows, _ = _supabase_get("Transactions", params=paged_params)
+        rows, _ = _supabase_get(table, params=paged_params)
         if not rows:
             break
         all_rows.extend(rows)
