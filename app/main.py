@@ -177,43 +177,278 @@ def _parse_iso_datetime(value: str) -> Optional[datetime]:
         return None
 
 
+def _coerce_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_string(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _hostel_filters(
+    hostel_id: Optional[int], field: str = "hostel_id"
+) -> List[Tuple[str, str]]:
+    if hostel_id is None:
+        return []
+    return [(field, f"eq.{hostel_id}")]
+
+
+def _build_login_filters(
+    hostel_id: Optional[int] = None,
+    plan_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> List[Tuple[str, str]]:
+    filters = _hostel_filters(hostel_id)
+    if plan_type:
+        filters.append(("type", f"eq.{plan_type}"))
+    filters.extend(_parse_date_range(date_from, date_to))
+    return filters
+
+
+def _build_sold_login_filters(
+    hostel_id: Optional[int] = None,
+    plan_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> List[Tuple[str, str]]:
+    filters = _hostel_filters(hostel_id)
+    if plan_type:
+        filters.append(("plan_type", f"eq.{plan_type}"))
+    filters.extend(_parse_date_range(date_from, date_to))
+    return filters
+
+
+def _build_transaction_filters(
+    plan_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    search: Optional[str] = None,
+) -> List[Tuple[str, str]]:
+    filters: List[Tuple[str, str]] = []
+    if plan_type:
+        filters.append(("plan_type", f"eq.{plan_type}"))
+    if search:
+        term = search.strip()
+        if term:
+            filters.append(
+                (
+                    "or",
+                    (
+                        f"(payment_reference.ilike.*{term}*,"
+                        f"customer_email.ilike.*{term}*,"
+                        f"credential_username.ilike.*{term}*)"
+                    ),
+                )
+            )
+    filters.extend(_parse_date_range(date_from, date_to))
+    return filters
+
+
+def _fetch_hostels() -> List[Dict[str, Any]]:
+    rows, _ = _supabase_get(
+        "Hostels",
+        params=[
+            ("select", "id,hostel_name,split_code,created_at"),
+            ("order", "hostel_name.asc"),
+        ],
+    )
+    return rows
+
+
+def _hostel_lookup() -> Tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+    hostels = []
+    hostels_by_id: Dict[int, Dict[str, Any]] = {}
+    for row in _fetch_hostels():
+        hostel = dict(row)
+        hostel_id = _coerce_int(hostel.get("id"))
+        if hostel_id is None:
+            continue
+        hostel["id"] = hostel_id
+        hostels.append(hostel)
+        hostels_by_id[hostel_id] = hostel
+    return hostels, hostels_by_id
+
+
+def _attach_hostel_metadata(
+    row: Dict[str, Any],
+    hostels_by_id: Dict[int, Dict[str, Any]],
+    field: str = "hostel_id",
+) -> Dict[str, Any]:
+    enriched = dict(row)
+    hostel_id = _coerce_int(enriched.get(field))
+    enriched["hostel_id"] = hostel_id
+    hostel = hostels_by_id.get(hostel_id) if hostel_id is not None else None
+    enriched["hostel_name"] = hostel.get("hostel_name") if hostel else None
+    enriched["split_code"] = hostel.get("split_code") if hostel else None
+    return enriched
+
+
+def _attach_hostels(
+    rows: List[Dict[str, Any]],
+    hostels_by_id: Dict[int, Dict[str, Any]],
+    field: str = "hostel_id",
+) -> List[Dict[str, Any]]:
+    return [_attach_hostel_metadata(row, hostels_by_id, field=field) for row in rows]
+
+
+def _build_sold_login_lookup(
+    hostel_id: Optional[int] = None,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    filters = _hostel_filters(hostel_id)
+    sold_rows = _iterate_table(
+        "SoldLogins",
+        select="username,payment_reference,hostel_id",
+        filters=filters,
+    )
+    by_reference: Dict[str, Dict[str, Any]] = {}
+    by_username: Dict[str, Dict[str, Any]] = {}
+    for row in sold_rows:
+        payment_reference = _clean_string(row.get("payment_reference"))
+        username = _clean_string(row.get("username"))
+        if payment_reference:
+            by_reference[payment_reference] = row
+        if username:
+            by_username[username] = row
+    return by_reference, by_username
+
+
+def _enrich_transactions_with_hostels(
+    rows: List[Dict[str, Any]],
+    sold_by_reference: Dict[str, Dict[str, Any]],
+    sold_by_username: Dict[str, Dict[str, Any]],
+    hostels_by_id: Dict[int, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    enriched_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        payment_reference = _clean_string(row.get("payment_reference"))
+        username = _clean_string(row.get("credential_username"))
+        sold_row = sold_by_reference.get(payment_reference) or sold_by_username.get(
+            username
+        )
+        enriched = dict(row)
+        enriched["hostel_id"] = _coerce_int(sold_row.get("hostel_id")) if sold_row else None
+        hostel = (
+            hostels_by_id.get(enriched["hostel_id"])
+            if enriched["hostel_id"] is not None
+            else None
+        )
+        enriched["hostel_name"] = hostel.get("hostel_name") if hostel else None
+        enriched["split_code"] = hostel.get("split_code") if hostel else None
+        enriched_rows.append(enriched)
+    return enriched_rows
+
+
+def _load_transactions_with_hostels(
+    *,
+    hostel_id: Optional[int] = None,
+    plan_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    search: Optional[str] = None,
+    select: str = (
+        "payment_reference,customer_email,plan_type,amount,"
+        "credential_username,created_at"
+    ),
+) -> List[Dict[str, Any]]:
+    transaction_rows = _iterate_transactions(
+        filters=_build_transaction_filters(
+            plan_type=plan_type,
+            date_from=date_from,
+            date_to=date_to,
+            search=search,
+        ),
+        select=select,
+    )
+    if not transaction_rows:
+        return []
+    _, hostels_by_id = _hostel_lookup()
+    sold_by_reference, sold_by_username = _build_sold_login_lookup(hostel_id=hostel_id)
+    enriched_rows = _enrich_transactions_with_hostels(
+        transaction_rows,
+        sold_by_reference,
+        sold_by_username,
+        hostels_by_id,
+    )
+    if hostel_id is None:
+        return enriched_rows
+    return [
+        row for row in enriched_rows if _coerce_int(row.get("hostel_id")) == hostel_id
+    ]
+
+
+def _sort_rows_by_created_at_desc(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        rows,
+        key=lambda row: _parse_iso_datetime(row.get("created_at", "")) or datetime.min.replace(
+            tzinfo=timezone.utc
+        ),
+        reverse=True,
+    )
+
+
+def _hostel_scope(
+    hostel_id: Optional[int], hostels_by_id: Dict[int, Dict[str, Any]]
+) -> Dict[str, Any]:
+    hostel = hostels_by_id.get(hostel_id) if hostel_id is not None else None
+    return {
+        "mode": "hostel" if hostel_id is not None else "all",
+        "hostel_id": hostel_id,
+        "hostel_name": hostel.get("hostel_name") if hostel else None,
+        "split_code": hostel.get("split_code") if hostel else None,
+    }
+
+
+@app.get("/hostels")
+def hostels_list():
+    hostels, _ = _hostel_lookup()
+    return {"rows": hostels, "as_of": datetime.now(timezone.utc).isoformat()}
+
+
 @app.get("/dashboard/summary")
-def dashboard_summary():
+def dashboard_summary(hostel_id: Optional[int] = None):
     now = datetime.now(timezone.utc)
     today_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
     tomorrow_start = today_start + timedelta(days=1)
     today_start_iso = today_start.isoformat()
     tomorrow_start_iso = tomorrow_start.isoformat()
     active_window_start = now - timedelta(days=30)
+    _, hostels_by_id = _hostel_lookup()
 
-    revenue_rows, _ = _supabase_get(
-        "Transactions",
-        params=[
-            ("select", "amount"),
-            ("created_at", f"gte.{today_start_iso}"),
-            ("created_at", f"lt.{tomorrow_start_iso}"),
-        ],
+    revenue_rows = _load_transactions_with_hostels(
+        hostel_id=hostel_id,
+        date_from=today_start.date().isoformat(),
+        date_to=today_start.date().isoformat(),
+        select="payment_reference,credential_username,amount,created_at",
     )
     revenue_today = _sum_amounts(revenue_rows, "amount")
 
     credentials_sold_today = _count_rows(
         "SoldLogins",
-        filters=[
-            ("created_at", f"gte.{today_start_iso}"),
-            ("created_at", f"lt.{tomorrow_start_iso}"),
-        ],
+        filters=_build_sold_login_filters(
+            hostel_id=hostel_id,
+            date_from=today_start.date().isoformat(),
+            date_to=today_start.date().isoformat(),
+        ),
     )
 
-    remaining_credentials = _count_rows("Logins")
+    remaining_credentials = _count_rows(
+        "Logins",
+        filters=_hostel_filters(hostel_id),
+    )
 
-    sold_rows, _ = _supabase_get(
+    sold_rows = _iterate_table(
         "SoldLogins",
-        params=[
-            ("select", "created_at,plan_type"),
+        select="created_at,plan_type,hostel_id",
+        filters=_build_sold_login_filters(hostel_id=hostel_id)
+        + [
             ("created_at", f"gte.{active_window_start.isoformat()}"),
             ("plan_type", "neq.1.5-Gigabyte"),
-            ("order", "created_at.desc"),
-            ("limit", "10000"),
         ],
     )
 
@@ -238,25 +473,25 @@ def dashboard_summary():
         "active_users": active_users,
         "remaining_credentials": remaining_credentials,
         "currency": "GH₵",
+        "scope": _hostel_scope(hostel_id, hostels_by_id),
         "as_of": now.isoformat(),
     }
 
 
 @app.get("/dashboard/sales")
-def dashboard_sales():
+def dashboard_sales(hostel_id: Optional[int] = None):
     now = datetime.now(timezone.utc)
     window_days = 7
     today_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
     window_start = today_start - timedelta(days=window_days - 1)
     window_end = today_start + timedelta(days=1)
+    _, hostels_by_id = _hostel_lookup()
 
-    rows, _ = _supabase_get(
-        "Transactions",
-        params=[
-            ("select", "amount,created_at"),
-            ("created_at", f"gte.{window_start.isoformat()}"),
-            ("created_at", f"lt.{window_end.isoformat()}"),
-        ],
+    rows = _load_transactions_with_hostels(
+        hostel_id=hostel_id,
+        date_from=window_start.date().isoformat(),
+        date_to=today_start.date().isoformat(),
+        select="payment_reference,credential_username,amount,created_at",
     )
 
     buckets: Dict[datetime, float] = {}
@@ -285,12 +520,14 @@ def dashboard_sales():
         "window_days": window_days,
         "currency": "GH₵",
         "points": points,
+        "scope": _hostel_scope(hostel_id, hostels_by_id),
         "as_of": now.isoformat(),
     }
 
 
 @app.get("/credentials/summary")
-def credentials_summary():
+def credentials_summary(hostel_id: Optional[int] = None):
+    _, hostels_by_id = _hostel_lookup()
     plans, _ = _supabase_get(
         "Plans",
         params=[
@@ -298,7 +535,11 @@ def credentials_summary():
             ("order", "plan_type.asc"),
         ],
     )
-    login_rows = _iterate_table("Logins", select="type")
+    login_rows = _iterate_table(
+        "Logins",
+        select="type,hostel_id",
+        filters=_hostel_filters(hostel_id),
+    )
 
     counts: Dict[str, int] = {}
     for row in login_rows:
@@ -337,7 +578,12 @@ def credentials_summary():
             }
         )
 
-    return {"plans": summary, "as_of": datetime.now(timezone.utc).isoformat()}
+    return {
+        "plans": summary,
+        "total_remaining": len(login_rows),
+        "scope": _hostel_scope(hostel_id, hostels_by_id),
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _parse_date_range(
@@ -427,23 +673,25 @@ def _resolve_bucket_window(
     *,
     full_range: bool = False,
     plan_type: Optional[str] = None,
+    hostel_id: Optional[int] = None,
 ) -> Tuple[datetime, datetime]:
     window_units = max(window_units, 1)
     now = datetime.now(timezone.utc)
     today = _start_of_day(now)
 
     if full_range:
-        earliest_params: List[Tuple[str, str]] = [
-            ("select", "created_at"),
-            ("order", "created_at.asc"),
-            ("limit", "1"),
-        ]
-        if plan_type:
-            earliest_params.append(("plan_type", f"eq.{plan_type}"))
-        earliest_rows, _ = _supabase_get("Transactions", params=earliest_params)
         earliest = None
-        if earliest_rows:
-            earliest = _parse_iso_datetime(earliest_rows[0].get("created_at", ""))
+        rows = _load_transactions_with_hostels(
+            hostel_id=hostel_id,
+            plan_type=plan_type,
+            select="payment_reference,credential_username,created_at,plan_type",
+        )
+        for row in rows:
+            created_at = _parse_iso_datetime(row.get("created_at", ""))
+            if not created_at:
+                continue
+            if earliest is None or created_at < earliest:
+                earliest = created_at
         if earliest:
             start = _start_of_day(earliest.astimezone(timezone.utc))
         else:
@@ -475,8 +723,14 @@ def _resolve_bucket_window(
 def _iterate_transactions(
     filters: Optional[List[Tuple[str, str]]] = None,
     select: str = "customer_email,credential_username,amount,plan_type,created_at",
+    page_size: int = 1000,
 ) -> List[Dict[str, Any]]:
-    return _iterate_table("Transactions", select=select, filters=filters)
+    return _iterate_table(
+        "Transactions",
+        select=select,
+        filters=filters,
+        page_size=page_size,
+    )
 
 
 def _iterate_table(
@@ -507,10 +761,11 @@ def _iterate_table(
 
 def _aggregate_customers(
     filters: Optional[List[Tuple[str, str]]] = None,
+    rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     customers: Dict[str, Dict[str, Any]] = {}
-    rows = _iterate_transactions(filters)
-    for row in rows:
+    transaction_rows = rows if rows is not None else _iterate_transactions(filters)
+    for row in transaction_rows:
         email = (row.get("customer_email") or "").strip()
         username = (row.get("credential_username") or "").strip()
         key = (email or username or "unknown").lower()
@@ -544,14 +799,16 @@ def credentials_logins(
     plan_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    hostel_id: Optional[int] = None,
     page: int = 1,
     page_size: int = 20,
 ):
     page = max(page, 1)
     page_size = max(min(page_size, 200), 1)
     offset = (page - 1) * page_size
+    _, hostels_by_id = _hostel_lookup()
     params: List[Tuple[str, str]] = [
-        ("select", "username,password,type,created_at"),
+        ("select", "username,password,type,created_at,hostel_id"),
         ("order", "username.asc"),
         ("limit", str(page_size)),
         ("offset", str(offset)),
@@ -565,6 +822,7 @@ def credentials_logins(
         if term:
             params.append(("username", f"ilike.*{term}*"))
 
+    params.extend(_hostel_filters(hostel_id))
     params.extend(_parse_date_range(date_from, date_to))
 
     rows, headers = _supabase_get(
@@ -574,10 +832,11 @@ def credentials_logins(
     )
     total = _parse_content_range_total(headers)
     return {
-        "rows": rows,
+        "rows": _attach_hostels(rows, hostels_by_id),
         "page": page,
         "page_size": page_size,
         "total": total,
+        "scope": _hostel_scope(hostel_id, hostels_by_id),
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -588,14 +847,19 @@ def credentials_sold(
     plan_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    hostel_id: Optional[int] = None,
     page: int = 1,
     page_size: int = 20,
 ):
     page = max(page, 1)
     page_size = max(min(page_size, 200), 1)
     offset = (page - 1) * page_size
+    _, hostels_by_id = _hostel_lookup()
     params: List[Tuple[str, str]] = [
-        ("select", "username,password,customer_email,created_at,plan_type"),
+        (
+            "select",
+            "username,password,customer_email,created_at,plan_type,hostel_id,payment_reference",
+        ),
         ("order", "created_at.desc"),
         ("limit", str(page_size)),
         ("offset", str(offset)),
@@ -614,6 +878,7 @@ def credentials_sold(
                 )
             )
 
+    params.extend(_hostel_filters(hostel_id))
     params.extend(_parse_date_range(date_from, date_to))
 
     rows, headers = _supabase_get(
@@ -623,10 +888,11 @@ def credentials_sold(
     )
     total = _parse_content_range_total(headers)
     return {
-        "rows": rows,
+        "rows": _attach_hostels(rows, hostels_by_id),
         "page": page,
         "page_size": page_size,
         "total": total,
+        "scope": _hostel_scope(hostel_id, hostels_by_id),
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -636,54 +902,65 @@ def sales_summary(
     plan_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    hostel_id: Optional[int] = None,
 ):
-    params: List[Tuple[str, str]] = [
-        ("select", "amount,plan_type"),
-    ]
+    hostels, hostels_by_id = _hostel_lookup()
+    rows = _load_transactions_with_hostels(
+        hostel_id=hostel_id,
+        plan_type=plan_type,
+        date_from=date_from,
+        date_to=date_to,
+        select=(
+            "payment_reference,credential_username,amount,plan_type,"
+            "created_at,customer_email"
+        ),
+    )
 
-    if plan_type:
-        params.append(("plan_type", f"eq.{plan_type}"))
-
-    date_filters = _parse_date_range(date_from, date_to)
-    params.extend(date_filters)
-
-    sold_filters: List[Tuple[str, str]] = []
-    if plan_type:
-        sold_filters.append(("plan_type", f"eq.{plan_type}"))
-    sold_filters.extend(date_filters)
-    logins_sold = _count_rows("SoldLogins", filters=sold_filters)
+    logins_sold = _count_rows(
+        "SoldLogins",
+        filters=_build_sold_login_filters(
+            hostel_id=hostel_id,
+            plan_type=plan_type,
+            date_from=date_from,
+            date_to=date_to,
+        ),
+    )
 
     total_revenue = 0.0
     transaction_count = 0
     plan_totals: Dict[str, Dict[str, Union[int, float]]] = {}
+    hostel_totals: Dict[int, Dict[str, Union[int, float, str, None]]] = {}
     plan_options = set()
+    transaction_count = len(rows)
+    total_revenue = _sum_amounts(rows, "amount")
 
-    offset = 0
-    page_size = 1000
-    while True:
-        paged_params = params + [("limit", str(page_size)), ("offset", str(offset))]
-        rows, _ = _supabase_get("Transactions", params=paged_params)
-        if not rows:
-            break
+    for row in rows:
+        plan = (row.get("plan_type") or "").strip() or "Unknown"
+        plan_options.add(plan)
+        entry = plan_totals.setdefault(plan, {"count": 0, "revenue": 0.0})
+        entry["count"] = int(entry["count"]) + 1
+        amount = 0.0
+        try:
+            amount = float(row.get("amount") or 0)
+            entry["revenue"] = float(entry["revenue"]) + amount
+        except (TypeError, ValueError):
+            amount = 0.0
 
-        transaction_count += len(rows)
-        total_revenue += _sum_amounts(rows, "amount")
-
-        for row in rows:
-            plan = (row.get("plan_type") or "").strip() or "Unknown"
-            plan_options.add(plan)
-            entry = plan_totals.setdefault(plan, {"count": 0, "revenue": 0.0})
-            entry["count"] = int(entry["count"]) + 1
-            try:
-                entry["revenue"] = float(entry["revenue"]) + float(
-                    row.get("amount") or 0
-                )
-            except (TypeError, ValueError):
-                continue
-
-        if len(rows) < page_size:
-            break
-        offset += page_size
+        row_hostel_id = _coerce_int(row.get("hostel_id"))
+        if row_hostel_id is None or row_hostel_id not in hostels_by_id:
+            continue
+        hostel_entry = hostel_totals.setdefault(
+            row_hostel_id,
+            {
+                "hostel_id": row_hostel_id,
+                "hostel_name": hostels_by_id[row_hostel_id].get("hostel_name"),
+                "split_code": hostels_by_id[row_hostel_id].get("split_code"),
+                "count": 0,
+                "revenue": 0.0,
+            },
+        )
+        hostel_entry["count"] = int(hostel_entry["count"]) + 1
+        hostel_entry["revenue"] = float(hostel_entry["revenue"]) + amount
 
     avg_sales_per_day = None
     if transaction_count:
@@ -692,17 +969,13 @@ def sales_summary(
             days = max((end_exclusive - start).days, 1)
             avg_sales_per_day = total_revenue / days if days else None
         else:
-            earliest_params: List[Tuple[str, str]] = [
-                ("select", "created_at"),
-                ("order", "created_at.asc"),
-                ("limit", "1"),
-            ]
-            if plan_type:
-                earliest_params.append(("plan_type", f"eq.{plan_type}"))
-            earliest_rows, _ = _supabase_get("Transactions", params=earliest_params)
             earliest = None
-            if earliest_rows:
-                earliest = _parse_iso_datetime(earliest_rows[0].get("created_at", ""))
+            for row in rows:
+                created_at = _parse_iso_datetime(row.get("created_at", ""))
+                if not created_at:
+                    continue
+                if earliest is None or created_at < earliest:
+                    earliest = created_at
             if earliest:
                 start = _start_of_day(earliest.astimezone(timezone.utc))
                 today = datetime.now(timezone.utc)
@@ -741,6 +1014,23 @@ def sales_summary(
         }
         for plan in sorted(plan_totals.keys())
     ]
+    hostel_breakdown = [
+        {
+            "hostel_id": row_hostel_id,
+            "hostel_name": data.get("hostel_name"),
+            "split_code": data.get("split_code"),
+            "count": int(data.get("count") or 0),
+            "revenue": round(float(data.get("revenue") or 0), 2),
+        }
+        for row_hostel_id, data in sorted(
+            hostel_totals.items(),
+            key=lambda item: (
+                float(item[1].get("revenue") or 0),
+                int(item[1].get("count") or 0),
+            ),
+            reverse=True,
+        )
+    ]
 
     return {
         "total_revenue": round(total_revenue, 2),
@@ -752,9 +1042,12 @@ def sales_summary(
         "top_plan": top_plan,
         "top_sold_plan": top_sold_plan,
         "plan_breakdown": plan_breakdown,
+        "hostel_breakdown": hostel_breakdown,
         "plan_options": plan_options,
         "currency": "GH₵",
         "range": {"from": date_from, "to": date_to},
+        "scope": _hostel_scope(hostel_id, hostels_by_id),
+        "hostels": hostels,
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -765,52 +1058,30 @@ def sales_transactions(
     plan_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    hostel_id: Optional[int] = None,
     page: int = 1,
     page_size: int = 20,
 ):
     page = max(page, 1)
     page_size = max(min(page_size, 200), 1)
     offset = (page - 1) * page_size
-    params: List[Tuple[str, str]] = [
-        (
-            "select",
-            "payment_reference,customer_email,plan_type,amount,credential_username,created_at",
-        ),
-        ("order", "created_at.desc"),
-        ("limit", str(page_size)),
-        ("offset", str(offset)),
-    ]
-
-    if plan_type:
-        params.append(("plan_type", f"eq.{plan_type}"))
-
-    if search:
-        term = search.strip()
-        if term:
-            params.append(
-                (
-                    "or",
-                    (
-                        f"(payment_reference.ilike.*{term}*,"
-                        f"customer_email.ilike.*{term}*,"
-                        f"credential_username.ilike.*{term}*)"
-                    ),
-                )
-            )
-
-    params.extend(_parse_date_range(date_from, date_to))
-
-    rows, headers = _supabase_get(
-        "Transactions",
-        params=params,
-        extra_headers={"Prefer": "count=exact"},
+    _, hostels_by_id = _hostel_lookup()
+    rows = _load_transactions_with_hostels(
+        hostel_id=hostel_id,
+        plan_type=plan_type,
+        date_from=date_from,
+        date_to=date_to,
+        search=search,
     )
-    total = _parse_content_range_total(headers)
+    rows = _sort_rows_by_created_at_desc(rows)
+    total = len(rows)
+    paged = rows[offset : offset + page_size]
     return {
-        "rows": rows,
+        "rows": paged,
         "page": page,
         "page_size": page_size,
         "total": total,
+        "scope": _hostel_scope(hostel_id, hostels_by_id),
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -821,16 +1092,18 @@ def sales_history(
     plan_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    hostel_id: Optional[int] = None,
     page: int = 1,
     page_size: int = 20,
 ):
     page = max(page, 1)
     page_size = max(min(page_size, 200), 1)
     offset = (page - 1) * page_size
+    _, hostels_by_id = _hostel_lookup()
     params: List[Tuple[str, str]] = [
         (
             "select",
-            "username,customer_email,plan_type,payment_reference,created_at",
+            "username,customer_email,plan_type,payment_reference,created_at,hostel_id",
         ),
         ("order", "created_at.desc"),
         ("limit", str(page_size)),
@@ -854,6 +1127,7 @@ def sales_history(
                 )
             )
 
+    params.extend(_hostel_filters(hostel_id))
     params.extend(_parse_date_range(date_from, date_to))
 
     rows, headers = _supabase_get(
@@ -863,10 +1137,11 @@ def sales_history(
     )
     total = _parse_content_range_total(headers)
     return {
-        "rows": rows,
+        "rows": _attach_hostels(rows, hostels_by_id),
         "page": page,
         "page_size": page_size,
         "total": total,
+        "scope": _hostel_scope(hostel_id, hostels_by_id),
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -876,13 +1151,23 @@ def customers_summary(
     search: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    hostel_id: Optional[int] = None,
     page: int = 1,
     page_size: int = 20,
 ):
     page = max(page, 1)
     page_size = max(min(page_size, 200), 1)
-    filters = _parse_date_range(date_from, date_to)
-    customers = _aggregate_customers(filters)
+    _, hostels_by_id = _hostel_lookup()
+    transaction_rows = _load_transactions_with_hostels(
+        hostel_id=hostel_id,
+        date_from=date_from,
+        date_to=date_to,
+        select=(
+            "payment_reference,customer_email,plan_type,amount,"
+            "credential_username,created_at"
+        ),
+    )
+    customers = _aggregate_customers(rows=transaction_rows)
 
     rows = list(customers.values())
     if search:
@@ -919,6 +1204,7 @@ def customers_summary(
         "page": page,
         "page_size": page_size,
         "total": total,
+        "scope": _hostel_scope(hostel_id, hostels_by_id),
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -928,17 +1214,24 @@ def customers_gifts(
     limit: int = 6,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    hostel_id: Optional[int] = None,
 ):
     limit = max(min(limit, 50), 1)
+    _, hostels_by_id = _hostel_lookup()
     params: List[Tuple[str, str]] = [
-        ("select", "username,customer_email,plan_type,created_at"),
+        ("select", "username,customer_email,plan_type,created_at,hostel_id"),
         ("order", "created_at.desc"),
         ("limit", str(limit)),
         ("or", "(customer_email.is.null,customer_email.eq.)"),
     ]
+    params.extend(_hostel_filters(hostel_id))
     params.extend(_parse_date_range(date_from, date_to))
     rows, _ = _supabase_get("SoldLogins", params=params)
-    return {"rows": rows, "as_of": datetime.now(timezone.utc).isoformat()}
+    return {
+        "rows": _attach_hostels(rows, hostels_by_id),
+        "scope": _hostel_scope(hostel_id, hostels_by_id),
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get("/sales/by-date")
@@ -946,6 +1239,7 @@ def sales_by_date(
     plan_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    hostel_id: Optional[int] = None,
     window_days: int = 7,
     bucket: str = "daily",
     window_units: int = 7,
@@ -966,6 +1260,7 @@ def sales_by_date(
             window_units,
             full_range=full_range,
             plan_type=plan_type,
+            hostel_id=hostel_id,
         )
     else:
         if bucket == "daily":
@@ -973,17 +1268,14 @@ def sales_by_date(
         start, end_exclusive = _resolve_bucket_window(
             None, None, bucket, window_units
         )
-
-    params: List[Tuple[str, str]] = [
-        ("select", "amount,created_at"),
-        ("created_at", f"gte.{start.isoformat()}"),
-        ("created_at", f"lt.{end_exclusive.isoformat()}"),
-    ]
-
-    if plan_type:
-        params.append(("plan_type", f"eq.{plan_type}"))
-
-    rows, _ = _supabase_get("Transactions", params=params)
+    _, hostels_by_id = _hostel_lookup()
+    rows = _load_transactions_with_hostels(
+        hostel_id=hostel_id,
+        plan_type=plan_type,
+        date_from=start.date().isoformat(),
+        date_to=(end_exclusive - timedelta(days=1)).date().isoformat(),
+        select="payment_reference,credential_username,amount,created_at,plan_type",
+    )
 
     now = datetime.now(timezone.utc)
     effective_end = min(end_exclusive, now)
@@ -1099,6 +1391,194 @@ def sales_by_date(
         "bucket": bucket,
         "window_units": window_units,
         "bucket_size": bucket_size,
+        "scope": _hostel_scope(hostel_id, hostels_by_id),
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/hostels/performance")
+def hostels_performance(
+    hostel_id: Optional[int] = None,
+    plan_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+):
+    hostels, hostels_by_id = _hostel_lookup()
+    rows_by_hostel: Dict[int, Dict[str, Any]] = {}
+    for hostel in hostels:
+        current_hostel_id = _coerce_int(hostel.get("id"))
+        if current_hostel_id is None:
+            continue
+        if hostel_id is not None and current_hostel_id != hostel_id:
+            continue
+        rows_by_hostel[current_hostel_id] = {
+            "hostel_id": current_hostel_id,
+            "hostel_name": hostel.get("hostel_name"),
+            "split_code": hostel.get("split_code"),
+            "remaining_credentials": 0,
+            "sold_credentials": 0,
+            "transactions": 0,
+            "revenue": 0.0,
+            "last_sale_at": None,
+            "_plan_totals": {},
+        }
+
+    login_rows = _iterate_table(
+        "Logins",
+        select="hostel_id,type",
+        filters=_build_login_filters(hostel_id=hostel_id, plan_type=plan_type),
+    )
+    for row in login_rows:
+        current_hostel_id = _coerce_int(row.get("hostel_id"))
+        entry = rows_by_hostel.get(current_hostel_id)
+        if entry:
+            entry["remaining_credentials"] += 1
+
+    sold_rows = _iterate_table(
+        "SoldLogins",
+        select="hostel_id,plan_type,created_at,payment_reference",
+        filters=_build_sold_login_filters(
+            hostel_id=hostel_id,
+            plan_type=plan_type,
+            date_from=date_from,
+            date_to=date_to,
+        ),
+    )
+    for row in sold_rows:
+        current_hostel_id = _coerce_int(row.get("hostel_id"))
+        entry = rows_by_hostel.get(current_hostel_id)
+        if entry:
+            entry["sold_credentials"] += 1
+
+    transaction_rows = _load_transactions_with_hostels(
+        hostel_id=hostel_id,
+        plan_type=plan_type,
+        date_from=date_from,
+        date_to=date_to,
+        select=(
+            "payment_reference,credential_username,amount,plan_type,"
+            "created_at,customer_email"
+        ),
+    )
+    unassigned_transactions = 0
+    unassigned_revenue = 0.0
+
+    for row in transaction_rows:
+        current_hostel_id = _coerce_int(row.get("hostel_id"))
+        entry = rows_by_hostel.get(current_hostel_id)
+        amount = 0.0
+        try:
+            amount = float(row.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+
+        if not entry:
+            unassigned_transactions += 1
+            unassigned_revenue += amount
+            continue
+
+        entry["transactions"] += 1
+        entry["revenue"] = float(entry["revenue"]) + amount
+
+        plan = _clean_string(row.get("plan_type")) or "Unknown"
+        plan_totals = entry["_plan_totals"]
+        plan_entry = plan_totals.setdefault(plan, {"count": 0, "revenue": 0.0})
+        plan_entry["count"] += 1
+        plan_entry["revenue"] += amount
+
+        created_at = _parse_iso_datetime(row.get("created_at", ""))
+        if created_at:
+            last_sale_at = entry["last_sale_at"]
+            if not last_sale_at or created_at > last_sale_at:
+                entry["last_sale_at"] = created_at
+
+    rows: List[Dict[str, Any]] = []
+    total_revenue = 0.0
+    total_transactions = 0
+    total_remaining = 0
+    total_sold = 0
+    for entry in rows_by_hostel.values():
+        total_revenue += float(entry["revenue"] or 0)
+        total_transactions += int(entry["transactions"] or 0)
+        total_remaining += int(entry["remaining_credentials"] or 0)
+        total_sold += int(entry["sold_credentials"] or 0)
+
+    for entry in rows_by_hostel.values():
+        plan_totals = entry.pop("_plan_totals")
+        top_plan = None
+        if plan_totals:
+            best_plan_name, best_plan_data = max(
+                plan_totals.items(),
+                key=lambda item: (item[1]["revenue"], item[1]["count"]),
+            )
+            top_plan = {
+                "plan_type": best_plan_name,
+                "count": int(best_plan_data["count"]),
+                "revenue": round(float(best_plan_data["revenue"]), 2),
+            }
+
+        last_sale_at = entry.get("last_sale_at")
+        entry["last_sale_at"] = last_sale_at.isoformat() if last_sale_at else None
+        entry["revenue"] = round(float(entry["revenue"] or 0), 2)
+        entry["top_plan"] = top_plan
+        entry["share_of_revenue"] = round(
+            entry["revenue"] / total_revenue, 4
+        ) if total_revenue else 0.0
+        rows.append(entry)
+
+    rows.sort(
+        key=lambda row: (
+            float(row.get("revenue") or 0),
+            int(row.get("transactions") or 0),
+            -int(row.get("remaining_credentials") or 0),
+        ),
+        reverse=True,
+    )
+
+    top_hostel = rows[0] if rows else None
+    lowest_stock_hostel = (
+        min(
+            rows,
+            key=lambda row: (
+                int(row.get("remaining_credentials") or 0),
+                float(row.get("revenue") or 0),
+            ),
+        )
+        if rows
+        else None
+    )
+
+    return {
+        "rows": rows,
+        "summary": {
+            "total_revenue": round(total_revenue, 2),
+            "total_transactions": total_transactions,
+            "total_remaining_credentials": total_remaining,
+            "total_sold_credentials": total_sold,
+            "unassigned_transactions": unassigned_transactions,
+            "unassigned_revenue": round(unassigned_revenue, 2),
+            "top_hostel": {
+                "hostel_id": top_hostel.get("hostel_id"),
+                "hostel_name": top_hostel.get("hostel_name"),
+                "revenue": top_hostel.get("revenue"),
+                "transactions": top_hostel.get("transactions"),
+            }
+            if top_hostel
+            else None,
+            "lowest_stock_hostel": {
+                "hostel_id": lowest_stock_hostel.get("hostel_id"),
+                "hostel_name": lowest_stock_hostel.get("hostel_name"),
+                "remaining_credentials": lowest_stock_hostel.get(
+                    "remaining_credentials"
+                ),
+            }
+            if lowest_stock_hostel
+            else None,
+        },
+        "currency": "GH₵",
+        "range": {"from": date_from, "to": date_to},
+        "scope": _hostel_scope(hostel_id, hostels_by_id),
+        "hostels": hostels,
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
 
